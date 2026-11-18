@@ -1,1 +1,292 @@
-build.yml
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.12
+      - name: Create project files
+        run: |
+          cat > 'build.gradle' <<'LITEOPT_EOF'
+          plugins {
+              id 'fabric-loom' version '1.9-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          LITEOPT_EOF
+          cat > 'gradle.properties' <<'LITEOPT_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.4
+          yarn_mappings=1.21.4+build.8
+          loader_version=0.16.10
+          fabric_version=0.119.2+1.21.4
+
+          mod_version=1.0.0
+          maven_group=dev.liteopt
+          archives_base_name=liteopt
+          LITEOPT_EOF
+          cat > 'settings.gradle' <<'LITEOPT_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          LITEOPT_EOF
+          mkdir -p 'src/main/java/dev/liteopt/mixin'
+          mkdir -p 'src/main/resources/assets/liteopt/lang'
+          cat > 'src/main/java/dev/liteopt/LiteOptClient.java' <<'LITEOPT_EOF'
+          package dev.liteopt;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class LiteOptClient implements ClientModInitializer {
+              private static KeyBinding overlayKey;
+
+              private long lastFrameNanos = System.nanoTime();
+              private double frameMs = 0;
+
+              @Override
+              public void onInitializeClient() {
+                  overlayKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.liteopt.overlay",
+                          InputUtil.Type.KEYSYM,
+                          GLFW.GLFW_KEY_F6,
+                          "category.liteopt"));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (overlayKey.wasPressed()) {
+                          if (isShiftDown(client)) {
+                              LiteOptConfig.enabled = !LiteOptConfig.enabled;
+                              if (client.player != null) {
+                                  client.player.sendMessage(Text.literal(
+                                          "LiteOpt: " + (LiteOptConfig.enabled ? "ВКЛ" : "ВЫКЛ")), true);
+                              }
+                          } else {
+                              LiteOptConfig.overlay = !LiteOptConfig.overlay;
+                          }
+                      }
+                  });
+
+                  HudRenderCallback.EVENT.register((context, tickCounter) -> {
+                      long now = System.nanoTime();
+                      double dt = (now - lastFrameNanos) / 1_000_000.0;
+                      lastFrameNanos = now;
+                      frameMs = frameMs * 0.9 + dt * 0.1;
+
+                      if (!LiteOptConfig.overlay) return;
+
+                      MinecraftClient mc = MinecraftClient.getInstance();
+                      String line = String.format("FPS: %d | %.1f мс | LiteOpt: %s",
+                              mc.getCurrentFps(), frameMs, LiteOptConfig.enabled ? "ВКЛ" : "ВЫКЛ");
+                      context.drawTextWithShadow(mc.textRenderer, line, 4, 4, 0xFFFFFF);
+                  });
+              }
+
+              private static boolean isShiftDown(MinecraftClient client) {
+                  long window = client.getWindow().getHandle();
+                  return InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT_SHIFT)
+                          || InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT_SHIFT);
+              }
+          }
+          LITEOPT_EOF
+          cat > 'src/main/java/dev/liteopt/LiteOptConfig.java' <<'LITEOPT_EOF'
+          package dev.liteopt;
+
+          public final class LiteOptConfig {
+              public static boolean enabled = true;
+              public static boolean overlay = false;
+              public static int entityMaxDistance = 64;
+              public static int maxParticles = 2000;
+
+              private LiteOptConfig() {}
+          }
+          LITEOPT_EOF
+          cat > 'src/main/java/dev/liteopt/mixin/EntityRenderDispatcherMixin.java' <<'LITEOPT_EOF'
+          package dev.liteopt.mixin;
+
+          import dev.liteopt.LiteOptConfig;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.render.Frustum;
+          import net.minecraft.client.render.entity.EntityRenderDispatcher;
+          import net.minecraft.entity.Entity;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(EntityRenderDispatcher.class)
+          public class EntityRenderDispatcherMixin {
+
+              @Inject(method = "shouldRender", at = @At("HEAD"), cancellable = true)
+              private <E extends Entity> void liteopt$distanceCull(E entity, Frustum frustum,
+                                                                   double x, double y, double z,
+                                                                   CallbackInfoReturnable<Boolean> cir) {
+                  if (!LiteOptConfig.enabled || LiteOptConfig.entityMaxDistance <= 0) return;
+                  if (entity == MinecraftClient.getInstance().player) return;
+
+                  double max = LiteOptConfig.entityMaxDistance;
+                  if (entity.squaredDistanceTo(x, y, z) > max * max) {
+                      cir.setReturnValue(false);
+                  }
+              }
+          }
+          LITEOPT_EOF
+          cat > 'src/main/java/dev/liteopt/mixin/ParticleManagerMixin.java' <<'LITEOPT_EOF'
+          package dev.liteopt.mixin;
+
+          import dev.liteopt.LiteOptConfig;
+          import net.minecraft.client.particle.Particle;
+          import net.minecraft.client.particle.ParticleManager;
+          import net.minecraft.client.particle.ParticleTextureSheet;
+          import org.spongepowered.asm.mixin.Final;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+          import org.spongepowered.asm.mixin.Unique;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          import java.util.Map;
+          import java.util.Queue;
+
+          @Mixin(ParticleManager.class)
+          public class ParticleManagerMixin {
+
+              @Shadow @Final
+              private Map<ParticleTextureSheet, Queue<Particle>> particles;
+
+              @Unique
+              private int liteopt$count = 0;
+
+              @Inject(method = "tick", at = @At("HEAD"))
+              private void liteopt$recount(CallbackInfo ci) {
+                  int total = 0;
+                  for (Queue<Particle> q : this.particles.values()) {
+                      total += q.size();
+                  }
+                  this.liteopt$count = total;
+              }
+
+              @Inject(method = "addParticle(Lnet/minecraft/client/particle/Particle;)V",
+                      at = @At("HEAD"), cancellable = true)
+              private void liteopt$limit(Particle particle, CallbackInfo ci) {
+                  if (!LiteOptConfig.enabled || LiteOptConfig.maxParticles <= 0) return;
+                  if (this.liteopt$count >= LiteOptConfig.maxParticles) {
+                      ci.cancel();
+                  } else {
+                      this.liteopt$count++;
+                  }
+              }
+          }
+          LITEOPT_EOF
+          cat > 'src/main/resources/assets/liteopt/lang/en_us.json' <<'LITEOPT_EOF'
+          {
+            "key.liteopt.overlay": "FPS overlay (Shift = toggle LiteOpt)",
+            "category.liteopt": "LiteOpt"
+          }
+          LITEOPT_EOF
+          cat > 'src/main/resources/assets/liteopt/lang/ru_ru.json' <<'LITEOPT_EOF'
+          {
+            "key.liteopt.overlay": "Оверлей FPS (Shift - вкл/выкл LiteOpt)",
+            "category.liteopt": "LiteOpt"
+          }
+          LITEOPT_EOF
+          cat > 'src/main/resources/fabric.mod.json' <<'LITEOPT_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "liteopt",
+            "version": "${version}",
+            "name": "LiteOpt",
+            "description": "Lightweight client optimization.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["dev.liteopt.LiteOptClient"]
+            },
+            "mixins": ["liteopt.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.4",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          LITEOPT_EOF
+          cat > 'src/main/resources/liteopt.mixins.json' <<'LITEOPT_EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "dev.liteopt.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": [
+              "EntityRenderDispatcherMixin",
+              "ParticleManagerMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          LITEOPT_EOF
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liteopt-jar
+          path: build/libs/*.jar
